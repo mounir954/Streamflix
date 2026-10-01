@@ -1,0 +1,134 @@
+package com.streamflixreborn.streamflix.utils
+
+import com.streamflixreborn.streamflix.providers.Provider
+import org.json.JSONObject
+import java.io.File
+import java.util.Properties
+
+// desktop stand-in for the Android SharedPreferences-backed UserPreferences, only the keys providers actually read
+object UserPreferences {
+
+    private val file = File(System.getProperty("user.home"), ".streamflix/preferences.properties")
+    private val props = Properties().apply {
+        if (file.exists()) file.inputStream().use { load(it) }
+    }
+
+    private fun get(key: String): String? = props.getProperty(key)
+
+    private fun set(key: String, value: String?) {
+        if (value == null) props.remove(key) else props.setProperty(key, value)
+        file.parentFile?.mkdirs()
+        file.outputStream().use { props.store(it, null) }
+    }
+
+    const val PROVIDER_URL = "URL"
+    const val PROVIDER_LOGO = "LOGO"
+    const val PROVIDER_PORTAL_URL = "PORTAL_URL"
+    const val PROVIDER_AUTOUPDATE = "AUTOUPDATE_URL"
+    const val PROVIDER_NEW_INTERFACE = "NEW_INTERFACE"
+    const val PROVIDER_PREFERRED_SERVER = "PREFERRED_SERVER"
+
+    private var providerCache: JSONObject = runCatching { JSONObject(get("provider_cache") ?: "{}") }.getOrDefault(JSONObject())
+
+    fun getProviderCache(provider: Provider, key: String): String {
+        return providerCache
+            .optJSONObject(provider.name)
+            ?.optString(key)
+            .orEmpty()
+    }
+
+    fun setProviderCache(provider: Provider?, key: String, value: String) {
+        val providerName = provider?.name ?: return
+        val innerJson = providerCache.optJSONObject(providerName)
+            ?: JSONObject().also { providerCache.put(providerName, it) }
+        innerJson.put(key, value)
+        set("provider_cache", providerCache.toString())
+    }
+
+    var providerLanguage: String?
+        get() = get("provider_language")
+        set(value) = set("provider_language", value)
+
+    var streamingcommunityDomain: String?
+        get() = get("streamingcommunity_domain")
+        set(value) = set("streamingcommunity_domain", value)
+
+    var enableTmdb: Boolean
+        get() = get("enable_tmdb")?.toBooleanStrictOrNull() ?: true
+        set(value) = set("enable_tmdb", value.toString())
+
+    // last-resort key, shared publicly across every clone of this project, without a default
+    // here tmdb lookups always fail
+    private const val DEFAULT_TMDB_API_KEY = "2dca580c2a14b55200e784d157207b4d"
+
+    // swapped in at CI release-build time from a repo secret by
+    // desktop-client/scripts/inject-tmdb-key.mjs - stays blank in the repo and in any
+    // local/dev build, never put a real key here
+    private const val PERSONAL_TMDB_API_KEY = ""
+
+    // the key baked into this particular build: an env var override if set, else the personal
+    // key above on a real CI release build, else the shared demo key so lookups still work
+    // with zero setup either way
+    private val builtInTmdbApiKey: String
+        get() = System.getenv("TMDB_API_KEY")?.ifEmpty { null }
+            ?: PERSONAL_TMDB_API_KEY.ifEmpty { null }
+            ?: DEFAULT_TMDB_API_KEY
+
+    // TMDb3 retries with this if the primary key comes back rate limited or revoked - always
+    // the public demo key, so a suspended/revoked personal key fails over automatically
+    val tmdbApiKeyFallback: String
+        get() = System.getenv("TMDB_API_KEY_FALLBACK")?.ifEmpty { null } ?: DEFAULT_TMDB_API_KEY
+
+    // an explicit key the user entered themselves (first-run setup or Settings) always wins
+    // over the built-in one
+    var tmdbApiKey: String
+        get() = get("tmdb_api_key")?.ifEmpty { null } ?: builtInTmdbApiKey
+        set(value) = set("tmdb_api_key", value)
+
+    fun hasCustomTmdbApiKey(): Boolean = !get("tmdb_api_key").isNullOrEmpty()
+
+    fun clearCustomTmdbApiKey() = set("tmdb_api_key", null)
+
+    // no bundled value on desktop (the Android build injects it from local.properties at build time)
+    var rabbitstreamSourceApi: String
+        get() = get("rabbitstream_source_api") ?: ""
+        set(value) = set("rabbitstream_source_api", value)
+
+    // default matches the Android app's DEFAULT_DOH_PROVIDER_URL: many of these sites' domains
+    // are filtered by plain ISP/system DNS, DNS-over-HTTPS is how the app resolves them at all
+    var dohProviderUrl: String
+        get() = get("doh_provider_url") ?: "https://cloudflare-dns.com/dns-query"
+        set(value) = set("doh_provider_url", value)
+
+    var cuevanaDomain: String
+        get() = get("cuevana_domain")?.ifEmpty { null } ?: "cuevana.gs"
+        set(value) = set("cuevana_domain", value)
+
+    var poseidonDomain: String
+        get() = get("poseidon_domain")?.ifEmpty { null } ?: "www.poseidonhd2.co"
+        set(value) = set("poseidon_domain", value)
+
+    var serverAutoSubtitlesDisabled: Boolean
+        get() = get("server_auto_subtitles_disabled")?.toBooleanStrictOrNull() ?: true
+        set(value) = set("server_auto_subtitles_disabled", value.toString())
+
+    var serienstreamDomain: String
+        get() = get("serienstream_domain")?.ifEmpty { null } ?: "s.to"
+        set(value) = set("serienstream_domain", value)
+
+    var moflixDomain: String
+        get() = get("moflix_domain")?.ifEmpty { null } ?: "moflix-stream.xyz"
+        set(value) = set("moflix_domain", value)
+
+    // extractors that read currentProvider just get null and fall back if none was ever picked
+    var currentProvider: Provider?
+        get() = get("selected_provider_name")?.let { Provider.findByName(it) }
+        set(value) = set("selected_provider_name", value?.name)
+
+    fun clearProviderCache(providerName: String) {
+        if (providerCache.has(providerName)) {
+            providerCache.remove(providerName)
+            set("provider_cache", providerCache.toString())
+        }
+    }
+}
