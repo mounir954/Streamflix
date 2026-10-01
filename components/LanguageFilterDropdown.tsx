@@ -1,0 +1,97 @@
+"use client";
+
+import { useEffect, useRef, useState } from "react";
+import { ChevronDown, Globe } from "lucide-react";
+import { languageLabel, languageFlagUrl } from "@/lib/content-languages";
+import { cn } from "@/lib/utils";
+
+interface LanguageFilterDropdownProps {
+  value: string | null; // null = all languages
+  onChange: (code: string | null) => void;
+  availableLanguages: string[];
+  allLabel?: string;
+  className?: string;
+  buttonClassName?: string;
+  chevronClassName?: string;
+  align?: "left" | "right";
+}
+
+// custom dropdown so we can show real flag images, windows has no flag emoji glyphs anyway
+export function LanguageFilterDropdown({
+  value,
+  onChange,
+  availableLanguages,
+  allLabel = "All languages",
+  className = "",
+  buttonClassName = "",
+  chevronClassName = "",
+  align = "right",
+}: LanguageFilterDropdownProps) {
+  const [open, setOpen] = useState(false);
+  const ref = useRef<HTMLDivElement>(null);
+
+  useEffect(() => {
+    if (!open) return;
+    const onClickOutside = (e: MouseEvent) => {
+      if (ref.current && !ref.current.contains(e.target as Node)) setOpen(false);
+    };
+    document.addEventListener("mousedown", onClickOutside);
+    return () => document.removeEventListener("mousedown", onClickOutside);
+  }, [open]);
+
+  const select = (code: string | null) => {
+    onChange(code);
+    setOpen(false);
+  };
+
+  return (
+    <div className={`relative flex-shrink-0 ${className}`} ref={ref}>
+      <button
+        type="button"
+        onClick={() => setOpen((v) => !v)}
+        className={cn(
+          "flex items-center gap-2 pl-3 pr-3.5 py-2.5 text-sm border-2 border-border bg-card text-foreground hover:border-primary transition-colors rounded-md",
+          buttonClassName
+        )}
+      >
+        {value && languageFlagUrl(value) ? (
+          <img src={languageFlagUrl(value)} alt="" className="w-5 h-3.5 object-cover flex-shrink-0" />
+        ) : (
+          <Globe className="w-4 h-4 text-muted-foreground flex-shrink-0" />
+        )}
+        <span className="whitespace-nowrap">{value ? languageLabel(value) : allLabel}</span>
+        <ChevronDown className={cn("w-3.5 h-3.5 flex-shrink-0 transition-transform", open ? "rotate-180" : "", chevronClassName)} />
+      </button>
+
+      {open && (
+        <div className={`absolute ${align === "left" ? "left-0" : "right-0"} mt-1 z-20 min-w-[180px] border-2 border-border bg-card shadow-lg py-1 rounded-md overflow-hidden`}>
+          <button
+            onClick={() => select(null)}
+            className={`w-full flex items-center gap-2 px-3 py-2 text-sm text-left hover:bg-secondary transition-colors ${
+              !value ? "bg-secondary/60 font-semibold" : ""
+            }`}
+          >
+            <Globe className="w-4 h-4 text-muted-foreground flex-shrink-0" />
+            {allLabel}
+          </button>
+          {availableLanguages.map((code) => (
+            <button
+              key={code}
+              onClick={() => select(code)}
+              className={`w-full flex items-center gap-2 px-3 py-2 text-sm text-left hover:bg-secondary transition-colors ${
+                value === code ? "bg-secondary/60 font-semibold" : ""
+              }`}
+            >
+              {languageFlagUrl(code) ? (
+                <img src={languageFlagUrl(code)} alt="" className="w-5 h-3.5 object-cover flex-shrink-0" />
+              ) : (
+                <Globe className="w-4 h-4 text-muted-foreground flex-shrink-0" />
+              )}
+              {languageLabel(code)}
+            </button>
+          ))}
+        </div>
+      )}
+    </div>
+  );
+}
