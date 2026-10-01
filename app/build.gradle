@@ -1,0 +1,82 @@
+plugins {
+    id 'com.android.application'
+    id 'org.jetbrains.kotlin.android'
+    id 'org.jetbrains.kotlin.plugin.serialization'
+}
+
+android {
+    namespace 'com.streamflixreborn.streamflix'
+    compileSdk 35
+
+    defaultConfig {
+        applicationId 'com.streamflixreborn.streamflix.mobile'
+        minSdk 26
+        // 34 : au-delà, Android force l'affichage bord à bord et la WebView passerait sous la barre d'état
+        targetSdk 34
+        versionCode 1
+        versionName '1.0.8-android'
+    }
+
+    buildTypes {
+        release {
+            // Pas de minification : les providers/extracteurs utilisent kotlinx.serialization, Gson (Retrofit) et Rhino
+            // par réflexion, R8 les casserait sans règles précises.
+            minifyEnabled false
+            shrinkResources false
+            // Signé avec la clé de debug pour que l'APK soit directement installable. Pour publier, utiliser sa propre clé.
+            signingConfig signingConfigs.debug
+        }
+    }
+
+    compileOptions {
+        sourceCompatibility JavaVersion.VERSION_17
+        targetCompatibility JavaVersion.VERSION_17
+        // java.time, Optional, etc. restent disponibles sous API 26 ; rien à désucrer
+    }
+
+    sourceSets {
+        main {
+            // AADecoder.java est dans src/main/java, le reste en Kotlin
+            java.srcDirs = ['src/main/java', 'src/main/kotlin']
+        }
+    }
+
+    packaging {
+        resources {
+            excludes += [
+                'META-INF/LICENSE*', 'META-INF/NOTICE*', 'META-INF/DEPENDENCIES', 'META-INF/INDEX.LIST',
+                'META-INF/*.kotlin_module', 'META-INF/versions/**', 'META-INF/{AL2.0,LGPL2.1}',
+                'META-INF/io.netty.versions.properties', 'META-INF/proguard/**', 'META-INF/MANIFEST.MF',
+                'META-INF/native-image/**', 'DebugProbesKt.bin', 'kotlin-tooling-metadata.json',
+            ]
+        }
+    }
+
+    lint {
+        abortOnError false
+        checkReleaseBuilds false
+    }
+}
+
+kotlin {
+    compilerOptions {
+        jvmTarget.set(org.jetbrains.kotlin.gradle.dsl.JvmTarget.JVM_17)
+    }
+}
+
+dependencies {
+    implementation 'org.jetbrains.kotlinx:kotlinx-coroutines-core:1.11.0'
+    implementation 'org.jetbrains.kotlinx:kotlinx-coroutines-android:1.11.0'
+
+    implementation 'com.squareup.retrofit2:retrofit:2.11.0'
+    implementation 'com.squareup.retrofit2:converter-gson:2.11.0'
+    implementation 'com.squareup.retrofit2:converter-scalars:2.11.0'
+    implementation 'com.squareup.okhttp3:okhttp:4.12.0'
+    implementation 'com.squareup.okhttp3:okhttp-dnsoverhttps:4.12.0'
+    implementation 'com.squareup.okhttp3:logging-interceptor:4.12.0'
+    implementation 'org.jsoup:jsoup:1.19.1'
+    implementation 'org.jetbrains.kotlinx:kotlinx-serialization-json:1.8.0'
+    // exécute le JS obfusqué de certains hébergeurs vidéo (CloseloadExtractor)
+    implementation 'org.mozilla:rhino:1.7.15'
+    // org.json n'est volontairement pas ajouté : Android l'embarque déjà
+}
