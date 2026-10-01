@@ -1,0 +1,903 @@
+package com.streamflixreborn.streamflix.mobile
+
+import com.streamflixreborn.streamflix.models.Genre
+import com.streamflixreborn.streamflix.models.Movie
+import com.streamflixreborn.streamflix.models.People
+import com.streamflixreborn.streamflix.models.Season
+import com.streamflixreborn.streamflix.models.Show
+import com.streamflixreborn.streamflix.models.TvShow
+import com.streamflixreborn.streamflix.models.Video
+import com.streamflixreborn.streamflix.extractors.ContentNotFoundException
+import com.streamflixreborn.streamflix.providers.IptvProvider
+import com.streamflixreborn.streamflix.providers.Provider
+import com.streamflixreborn.streamflix.utils.NetworkClient
+import com.streamflixreborn.streamflix.utils.TMDb3
+import com.streamflixreborn.streamflix.utils.UserPreferences
+import com.streamflixreborn.streamflix.mobile.http.HttpExchange
+import com.streamflixreborn.streamflix.mobile.http.HttpServer
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.async
+import kotlinx.coroutines.awaitAll
+import kotlinx.coroutines.channels.Channel
+import kotlinx.coroutines.runBlocking
+import kotlinx.coroutines.withTimeoutOrNull
+import kotlinx.serialization.Serializable
+import kotlinx.serialization.encodeToString
+import kotlinx.serialization.json.Json
+import kotlinx.serialization.json.jsonObject
+import kotlinx.serialization.json.jsonPrimitive
+import java.net.InetSocketAddress
+import java.net.URI
+import java.net.URLDecoder
+import java.net.URLEncoder
+import com.streamflixreborn.streamflix.mobile.nethttp.HttpClient
+import com.streamflixreborn.streamflix.mobile.nethttp.HttpRequest
+import com.streamflixreborn.streamflix.mobile.nethttp.HttpResponse
+import java.util.Base64
+import java.util.UUID
+import java.util.concurrent.ConcurrentHashMap
+import java.util.concurrent.Executors
+
+// port courant du backend (les favicons de providers pointent vers lui)
+@Volatile
+var backendPort: Int = 3001
+    private set
+
+// ouvre un asset embarqué dans l'APK (ex: "pluto-tv.webp"), branché par l'application au démarrage
+@Volatile
+var bundledAssetOpener: (String) -> java.io.InputStream? = { null }
+
+/**
+ * Démarre le serveur local : API du backend + interface web (export Next.js servi par [site]).
+ * Écoute uniquement sur 127.0.0.1. Port fixe de préférence : l'origine (http://127.0.0.1:PORT) détermine
+ * où le navigateur range cookies et localStorage (favoris, reprise de lecture), il ne doit donc pas changer.
+ */
+fun startBackend(preferredPort: Int, site: StaticSite, guard: SessionGuard? = null): HttpServer {
+    sessionGuard = guard
+    val server = bindLoopback(preferredPort)
+    backendPort = server.port
+    server.executor = Executors.newCachedThreadPool()
+
+    // interface web : pas de journal "debug" pour chaque fichier statique, mais le jeton est exigé
+    server.createContext("/") { if (sessionGuard?.check(it) != false) site.handle(it) }
+    server.createContext("/api/providers") { withCors(it) { handleProviders(it) } }
+    server.createContext("/api/home") { withCors(it) { handleHome(it) } }
+    server.createContext("/api/search") { withCors(it) { handleSearch(it) } }
+    server.createContext("/api/movie") { withCors(it) { handleMovie(it) } }
+    server.createContext("/api/tvshow") { withCors(it) { handleTvShow(it) } }
+    server.createContext("/api/episodes") { withCors(it) { handleEpisodes(it) } }
+    server.createContext("/api/genre") { withCors(it) { handleGenre(it) } }
+    server.createContext("/api/movies") { withCors(it) { handleMovies(it) } }
+    server.createContext("/api/tvshows") { withCors(it) { handleTvShows(it) } }
+    server.createContext("/api/stream") { withCors(it) { handleStream(it) } }
+    server.createContext("/api/download/start") { withCors(it) { handleDownloadStart(it) } }
+    server.createContext("/api/download/status") { withCors(it) { handleDownloadStatus(it) } }
+    server.createContext("/api/download/file") { withCors(it) { handleDownloadFile(it) } }
+    server.createContext("/api/download/delete") { withCors(it) { handleDownloadDelete(it) } }
+    server.createContext("/api/download/cancel") { withCors(it) { handleDownloadCancel(it) } }
+    server.createContext("/api/download/pause") { withCors(it) { handleDownloadPause(it) } }
+    server.createContext("/api/settings/tmdb-key") { withCors(it) { handleTmdbKeySettings(it) } }
+    server.createContext("/api/debug/stream") { withCors(it) { handleDebugStream(it) } }
+    server.createContext("/api/debug/check-providers") { withCors(it) { handleDebugCheckProviders(it) } }
+    server.createContext("/api/debug/cancel") { withCors(it) { handleDebugCancel(it) } }
+    server.createContext("/api/debug/command") { withCors(it) { handleDebugCommand(it) } }
+    server.createContext("/manifest.m3u8") { withCors(it) { serveManifest(it) } }
+    server.createContext("/segment") { withCors(it) { serveSegment(it) } }
+    server.createContext("/direct") { withCors(it) { serveDirect(it) } }
+    server.createContext("/image") { withCors(it) { serveImage(it) } }
+    server.createContext("/assets") { withCors(it) { serveAsset(it) } }
+
+    server.start()
+    println("StreamFlix backend listening on http://127.0.0.1:$backendPort")
+    return server
+}
+
+private fun bindLoopback(preferredPort: Int): HttpServer =
+    try {
+        HttpServer.createLoopback(preferredPort)
+    } catch (e: java.io.IOException) {
+        // port déjà pris (autre appli) : on laisse le système choisir
+        HttpServer.createLoopback(0)
+    }
+
+val json = Json { ignoreUnknownKeys = true; encodeDefaults = true }
+
+@Serializable
+data class GenreDto(val id: String, val name: String)
+
+@Serializable
+data class PeopleDto(val id: String, val name: String, val image: String? = null)
+
+@Serializable
+data class SeasonDto(val id: String, val number: Int, val title: String? = null)
+
+@Serializable
+data class EpisodeDto(
+    val id: String,
+    val number: Int,
+    val title: String? = null,
+    val overview: String? = null,
+    val poster: String? = null,
+)
+
+@Serializable
+data class ShowDto(
+    val id: String,
+    val title: String,
+    val type: String, // "movie" | "tv"
+    val poster: String? = null,
+    val banner: String? = null,
+    val logo: String? = null,
+    val overview: String? = null,
+    val rating: Double? = null,
+    val released: String? = null,
+    val runtime: Int? = null,
+    val trailer: String? = null,
+    val genres: List<GenreDto> = emptyList(),
+    val cast: List<PeopleDto> = emptyList(),
+    val seasons: List<SeasonDto> = emptyList(),
+    // 1 level deep, dont wanna recurse the whole recs graph
+    val recommendations: List<ShowDto> = emptyList(),
+)
+
+@Serializable
+data class CategoryDto(val name: String, val items: List<ShowDto>)
+
+@Serializable
+data class ProviderDto(val name: String, val language: String, val movies: Boolean, val tvShows: Boolean, val logo: String, val iptv: Boolean = false)
+
+@Serializable
+data class StreamRequest(
+    val provider: String,
+    val itemId: String,
+    val type: String, // "movie" | "tv"
+    val seasonNumber: Int? = null,
+    val episodeId: String? = null,
+    val episodeNumber: Int? = null,
+    // pins to one server instead of the usual try-em-all fallback, for the sub/dub picker
+    val serverId: String? = null,
+)
+
+@Serializable
+data class SubtitleDto(val label: String, val url: String, val default: Boolean = false)
+
+@Serializable
+data class ServerDto(val id: String, val name: String)
+
+@Serializable
+data class StreamResponse(
+    val success: Boolean,
+    val manifestUrl: String? = null,
+    // direct means a plain file like mp4, not an hls playlist
+    val type: String = "hls",
+    val subtitles: List<SubtitleDto> = emptyList(),
+    val servers: List<ServerDto> = emptyList(),
+    val error: String? = null,
+    // true only when every server confirmed "not there", never on a network/parse hiccup
+    val notFound: Boolean = false,
+)
+
+private fun Show.toDto(includeRecommendations: Boolean = true): ShowDto = when (this) {
+    is Movie -> ShowDto(
+        id = id, title = title, type = "movie", poster = poster, banner = banner, logo = logo, overview = overview,
+        rating = rating, released = released, runtime = runtime, trailer = trailer,
+        genres = genres.map { GenreDto(it.id, it.name) },
+        cast = cast.map { PeopleDto(it.id, it.name, it.image) },
+        recommendations = if (includeRecommendations) recommendations.map { it.toDto(includeRecommendations = false) } else emptyList(),
+    )
+    is TvShow -> ShowDto(
+        id = id, title = title, type = "tv", poster = poster, banner = banner, logo = logo, overview = overview,
+        rating = rating, released = released, runtime = runtime, trailer = trailer,
+        genres = genres.map { GenreDto(it.id, it.name) },
+        cast = cast.map { PeopleDto(it.id, it.name, it.image) },
+        seasons = seasons.map { SeasonDto(it.id, it.number, it.title) },
+        recommendations = if (includeRecommendations) recommendations.map { it.toDto(includeRecommendations = false) } else emptyList(),
+    )
+}
+
+fun providerByName(name: String?): Provider? =
+    Provider.providers.keys.firstOrNull { it.name == name }
+
+// these fire nonstop during normal playback, only their failures are worth a terminal line
+private val NOISY_PATHS = setOf("/manifest.m3u8", "/segment", "/direct", "/image", "/assets", "/api/download/status", "/api/debug/stream")
+
+private fun httpActionCategory(path: String): String = when {
+    path.startsWith("/api/download/") -> "download"
+    path.startsWith("/api/settings/") -> "settings"
+    path.startsWith("/api/debug/") -> "debug"
+    path == "/api/stream" -> "stream"
+    path in CATALOG_PATHS -> "catalog"
+    else -> "http"
+}
+
+private val CATALOG_PATHS = setOf(
+    "/api/providers", "/api/home", "/api/search", "/api/movie", "/api/tvshow",
+    "/api/genre", "/api/movies", "/api/tvshows", "/api/episodes", "/api/people",
+)
+
+// always "ExceptionClass: message", never a bare null (a category tag alone doesnt say what broke)
+fun Throwable.describe(): String {
+    val msg = message?.takeIf { it.isNotBlank() }
+    val cls = this::class.simpleName ?: "Exception"
+    return if (msg != null) "$cls: $msg" else cls
+}
+
+// jeton de session : seule la WebView de l'app (qui le reçoit via l'URL de démarrage) peut appeler le backend
+@Volatile
+var sessionGuard: SessionGuard? = null
+
+// Plus de "Access-Control-Allow-Origin: *" comme sur desktop : l'interface et l'API partagent la même origine,
+// et ouvrir le CORS laisserait n'importe quelle page web du téléphone lire les réponses.
+private fun withCors(exchange: HttpExchange, handle: () -> Unit) {
+    if (sessionGuard?.check(exchange) == false) return
+    if (exchange.requestMethod == "OPTIONS") {
+        exchange.sendResponseHeaders(204, -1)
+        exchange.close()
+        return
+    }
+    val path = exchange.requestURI.path
+    val category = httpActionCategory(path)
+    // POST bodies (stream/download) log their own provider-qualified detail further down instead
+    val provider = queryParams(exchange)["provider"]
+    val actionLabel = if (provider != null) "${exchange.requestMethod} $path ($provider)" else "${exchange.requestMethod} $path"
+    if (path !in NOISY_PATHS) DebugLog.info(category, actionLabel)
+    runCatching { handle() }.onFailure {
+        DebugLog.error(category, "$actionLabel failed: ${it.describe()}")
+        it.printStackTrace()
+        runCatching {
+            val bytes = """{"error":"${(it.message ?: "internal error").replace("\"", "'")}"}""".toByteArray()
+            exchange.responseHeaders.add("Content-Type", "application/json")
+            exchange.sendResponseHeaders(500, bytes.size.toLong())
+            exchange.responseBody.use { out -> out.write(bytes) }
+        }
+    }
+}
+
+fun sendJson(exchange: HttpExchange, status: Int, body: String) {
+    val bytes = body.toByteArray()
+    exchange.responseHeaders.add("Content-Type", "application/json; charset=utf-8")
+    exchange.sendResponseHeaders(status, bytes.size.toLong())
+    exchange.responseBody.use { it.write(bytes) }
+}
+
+fun queryParams(exchange: HttpExchange): Map<String, String> =
+    (exchange.requestURI.rawQuery ?: "").split("&").filter { it.isNotBlank() }
+        .associate { pair ->
+            val (k, v) = pair.split("=", limit = 2).let { it[0] to it.getOrElse(1) { "" } }
+            URLDecoder.decode(k, "UTF-8") to URLDecoder.decode(v, "UTF-8")
+        }
+
+// most provider logos are hotlinked/broken, google favicons just work better
+private fun faviconUrl(baseUrl: String): String {
+    // no scheme = URI treats it as a relative path and host comes back null
+    val withScheme = if (baseUrl.contains("://")) baseUrl else "https://$baseUrl"
+    val host = runCatching { URI.create(withScheme).host }.getOrNull()
+    return if (host.isNullOrBlank()) "" else "https://www.google.com/s2/favicons?domain=$host&sz=128"
+}
+
+// pluto's m3u8 comes from raw.githubusercontent.com so the generic favicon lookup shows github's icon instead
+private fun faviconOverride(providerName: String): String? {
+    return when {
+        providerName.startsWith("Pluto TV") -> "http://localhost:$backendPort/assets/pluto-tv.webp"
+        // tmdb is an api client not a scraped site, baseUrl is empty so the generic lookup has nothing to go on
+        providerName.startsWith("TMDB") -> faviconUrl("themoviedb.org")
+        else -> null
+    }
+}
+
+// these are busted rn, still work if queried directly, just dont show em in the picker
+val HIDDEN_PROVIDERS = setOf(
+    "SerienStream", "Moflix-stream", "CineHax",
+    "FrenchAnime", "SuperStream", "Anime Online Ninja",
+    "Animefenix", "AnimeFLV", "AnimeBum", "AfterDark", "CineCalidad", "Frembed", "StreamingIta",
+    "1Jour1Film", "Cine24h", "FilmyOnline", "Otakufr", "Zaluknij",
+    "SoloLatino", "Doramasflix", "FlixLatam", "MKissa",
+    "AnimeSuge", "HiAnime", "HDFilme", "Einschalten", "Anikoto",
+    // vavoo's shared relay domain has an expired TLS cert, temporary, un-hide once they renew it
+    "Vavoo Germany Live TV", "Vavoo Italy Live TV", "Vavoo France Live TV", "Vavoo Spain Live TV", "Vavoo Poland Live TV",
+)
+
+private fun handleProviders(exchange: HttpExchange) {
+    val dtos = Provider.providers.entries
+        .filter { (provider, _) -> provider.name !in HIDDEN_PROVIDERS }
+        .map { (provider, support) ->
+            // the favicon service cant read every domain this one moves to and hands back a generic globe, the site's
+            // own icon follows whichever domain it is on now
+            val favicon = if (provider.name.startsWith("StreamingCommunity")) provider.logo
+                else faviconOverride(provider.name) ?: faviconUrl(provider.baseUrl)
+            ProviderDto(provider.name, provider.language, support.movies, support.tvShows, favicon, iptv = provider is IptvProvider)
+        }.sortedBy { it.name.lowercase() }
+    sendJson(exchange, 200, json.encodeToString(dtos))
+}
+
+private fun handleHome(exchange: HttpExchange) {
+    val params = queryParams(exchange)
+    val provider = providerByName(params["provider"]) ?: return sendJson(exchange, 404, """{"error":"unknown provider"}""")
+    val categories = runBlocking { provider.getHome() }
+    val dtos = categories.mapNotNull { category ->
+        val items = category.list.filterIsInstance<Show>().map { it.toDto(includeRecommendations = false) }
+        if (items.isEmpty()) null else CategoryDto(category.name, items)
+    }
+    sendJson(exchange, 200, json.encodeToString(dtos))
+}
+
+private fun handleSearch(exchange: HttpExchange) {
+    val params = queryParams(exchange)
+    val provider = providerByName(params["provider"]) ?: return sendJson(exchange, 404, """{"error":"unknown provider"}""")
+    val q = params["q"].orEmpty()
+    if (q.isBlank()) return sendJson(exchange, 200, "[]")
+    val results = runBlocking { provider.search(q) }.filterIsInstance<Show>().map { it.toDto(includeRecommendations = false) }
+    sendJson(exchange, 200, json.encodeToString(results))
+}
+
+private fun handleMovie(exchange: HttpExchange) {
+    val params = queryParams(exchange)
+    val provider = providerByName(params["provider"]) ?: return sendJson(exchange, 404, """{"error":"unknown provider"}""")
+    val id = params["id"] ?: return sendJson(exchange, 400, """{"error":"missing id"}""")
+    val movie = runBlocking { provider.getMovie(id) }
+    sendJson(exchange, 200, json.encodeToString(movie.toDto()))
+}
+
+private fun handleTvShow(exchange: HttpExchange) {
+    val params = queryParams(exchange)
+    val provider = providerByName(params["provider"]) ?: return sendJson(exchange, 404, """{"error":"unknown provider"}""")
+    val id = params["id"] ?: return sendJson(exchange, 400, """{"error":"missing id"}""")
+    val tvShow = runBlocking { provider.getTvShow(id) }
+    sendJson(exchange, 200, json.encodeToString(tvShow.toDto()))
+}
+
+// season number not the backend's own season id, frontend already has that number handy
+private fun handleEpisodes(exchange: HttpExchange) {
+    val params = queryParams(exchange)
+    val provider = providerByName(params["provider"]) ?: return sendJson(exchange, 404, """{"error":"unknown provider"}""")
+    val tvId = params["tvId"] ?: return sendJson(exchange, 400, """{"error":"missing tvId"}""")
+    val seasonNumber = params["seasonNumber"]?.toIntOrNull() ?: return sendJson(exchange, 400, """{"error":"missing seasonNumber"}""")
+    val episodes = runBlocking {
+        val tvShow = provider.getTvShow(tvId)
+        val season = tvShow.seasons.firstOrNull { it.number == seasonNumber } ?: return@runBlocking null
+        val fromShow = season.episodes.ifEmpty { provider.getEpisodesBySeason(season.id) }
+        fromShow
+    } ?: return sendJson(exchange, 404, """{"error":"season not found"}""")
+    sendJson(exchange, 200, json.encodeToString(episodes.map { EpisodeDto(it.id, it.number, it.title, it.overview, it.poster) }))
+}
+
+private fun handleMovies(exchange: HttpExchange) {
+    val params = queryParams(exchange)
+    val provider = providerByName(params["provider"]) ?: return sendJson(exchange, 404, """{"error":"unknown provider"}""")
+    val page = params["page"]?.toIntOrNull() ?: 1
+    val movies = runBlocking { provider.getMovies(page) }.map { it.toDto(includeRecommendations = false) }
+    sendJson(exchange, 200, json.encodeToString(movies))
+}
+
+private fun handleTvShows(exchange: HttpExchange) {
+    val params = queryParams(exchange)
+    val provider = providerByName(params["provider"]) ?: return sendJson(exchange, 404, """{"error":"unknown provider"}""")
+    val page = params["page"]?.toIntOrNull() ?: 1
+    val tvShows = runBlocking { provider.getTvShows(page) }.map { it.toDto(includeRecommendations = false) }
+    sendJson(exchange, 200, json.encodeToString(tvShows))
+}
+
+@Serializable
+data class TmdbKeySettingsDto(val hasCustomKey: Boolean, val apiKey: String? = null)
+
+@Serializable
+data class SetTmdbKeyRequest(val apiKey: String? = null)
+
+private fun handleTmdbKeySettings(exchange: HttpExchange) {
+    when (exchange.requestMethod) {
+        "GET" -> {
+            val hasCustom = UserPreferences.hasCustomTmdbApiKey()
+            val dto = TmdbKeySettingsDto(hasCustom, if (hasCustom) UserPreferences.tmdbApiKey else null)
+            sendJson(exchange, 200, json.encodeToString(dto))
+        }
+        "POST" -> {
+            val body = exchange.requestBody.use { it.readBytes().decodeToString() }
+            val request = runCatching { json.decodeFromString<SetTmdbKeyRequest>(body) }.getOrNull()
+                ?: return sendJson(exchange, 400, """{"error":"invalid body"}""")
+            val apiKey = request.apiKey?.trim()
+
+            if (apiKey.isNullOrBlank()) {
+                UserPreferences.clearCustomTmdbApiKey()
+                TMDb3.rebuildService()
+                return sendJson(exchange, 200, """{"success":true}""")
+            }
+
+            // a bad key doesnt error, tmdb just answers empty/401, so check against a real endpoint first
+            val valid = runCatching {
+                val req = HttpRequest.newBuilder(URI.create("https://api.themoviedb.org/3/configuration?api_key=$apiKey")).GET().build()
+                httpClient.send(req, HttpResponse.BodyHandlers.discarding()).statusCode() == 200
+            }.getOrDefault(false)
+            if (!valid) return sendJson(exchange, 400, """{"success":false,"error":"invalid TMDB API key"}""")
+
+            UserPreferences.tmdbApiKey = apiKey
+            TMDb3.rebuildService()
+            sendJson(exchange, 200, """{"success":true}""")
+        }
+        else -> sendJson(exchange, 405, """{"error":"method not allowed"}""")
+    }
+}
+
+private fun handleGenre(exchange: HttpExchange) {
+    val params = queryParams(exchange)
+    val provider = providerByName(params["provider"]) ?: return sendJson(exchange, 404, """{"error":"unknown provider"}""")
+    val id = params["id"] ?: return sendJson(exchange, 400, """{"error":"missing id"}""")
+    val genre = runBlocking { provider.getGenre(id) }
+    val dto = CategoryDto(genre.name, genre.shows.map { it.toDto(includeRecommendations = false) })
+    sendJson(exchange, 200, json.encodeToString(dto))
+}
+
+// random token cause urls rotate on re-resolve, cant key by item id
+private val streamCache = ConcurrentHashMap<String, Video>()
+
+// marks a failure resolveVideoBlocking already logged in detail, so callers dont log a duplicate line
+class StreamResolutionLoggedException(override val cause: Throwable) : Exception(cause.message, cause)
+
+// shared by handleStream and the download pipeline, races every server and returns whichever comes back usable first
+fun resolveVideoBlocking(provider: Provider, request: StreamRequest): Pair<Video, List<Video.Server>> {
+    DebugLog.info("stream", "resolving ${request.type} on ${provider.name} (${request.itemId})")
+    // read from outside the timed-out block below so a timeout can still say how far it got
+    var stage = "fetching metadata"
+    // IO dispatcher, else the race below runs fully serialized on runBlocking's single thread
+    return runBlocking(Dispatchers.IO) {
+        // covers the metadata/server-list calls too, not just the race below, neither has its own timeout
+        withTimeoutOrNull(45_000L) {
+            val videoType = if (request.type == "movie") {
+                val movie = provider.getMovie(request.itemId)
+                Video.Type.Movie(id = movie.id, title = movie.title, releaseDate = movie.released ?: "", poster = movie.poster ?: "", imdbId = movie.imdbId)
+            } else {
+                val tvShow = provider.getTvShow(request.itemId)
+                // some titles just have no episodes on the site, dont crash on empty list
+                val season = tvShow.seasons.firstOrNull { it.number == request.seasonNumber }
+                    ?: tvShow.seasons.firstOrNull()
+                    ?: error("No episode available for this title on ${provider.name}")
+                val episodes = season.episodes.ifEmpty { provider.getEpisodesBySeason(season.id) }
+                val episode = episodes.firstOrNull { it.id == request.episodeId }
+                    ?: episodes.firstOrNull { it.number == request.episodeNumber }
+                    ?: episodes.firstOrNull()
+                    ?: error("No episode available for this title on ${provider.name}")
+                Video.Type.Episode(
+                    id = episode.id, number = episode.number, title = episode.title, poster = episode.poster, overview = episode.overview,
+                    tvShow = Video.Type.Episode.TvShow(tvShow.id, tvShow.title, tvShow.poster, tvShow.banner, tvShow.released, tvShow.imdbId),
+                    season = Video.Type.Episode.Season(season.number, season.title),
+                )
+            }
+            // needs the resolved episode id here, request.episodeId is null half the time
+            val itemIdForServers = when (videoType) {
+                is Video.Type.Movie -> videoType.id
+                is Video.Type.Episode -> videoType.id
+            }
+            stage = "listing servers"
+            val servers = provider.getServers(itemIdForServers, videoType)
+            if (servers.isEmpty()) error("no server available")
+            stage = "racing ${servers.size} server(s), 0 reported back"
+            DebugLog.info("stream", "racing ${servers.size} server(s) on ${provider.name}")
+            // race every server instead of waiting on all of them, some (flixlatam) fall back to a slow headless browser per mirror
+            val resultChannel = Channel<Pair<Video.Server, Result<Video>>>(servers.size)
+            val jobs = servers.map { server ->
+                async {
+                    val result = runCatching {
+                        val video = provider.getVideo(server)
+                        // an extractor can hand back a url that "resolves" but is dead on arrival (expired token, downed mirror),
+                        // catching that here means it gets treated as a failed server instead of surfacing as a broken player later
+                        if (video.source.isNotBlank() && !isPlayable(video)) error("source unreachable")
+                        video
+                    }
+                    resultChannel.send(server to result)
+                }
+            }
+            val working = mutableListOf<Video.Server>()
+            var firstSuccess: Pair<Video.Server, Video>? = null
+            var requestedMatch: Pair<Video.Server, Video>? = null
+            // collect every failure per server, only call it "not found" if EVERY server independently confirmed that
+            val errors = mutableListOf<Pair<Video.Server, Throwable>>()
+            var remaining = servers.size
+
+            suspend fun drainOne() {
+                val (server, videoResult) = resultChannel.receive()
+                remaining--
+                val video = videoResult.getOrNull()
+                if (video != null && video.source.isNotBlank()) {
+                    working.add(server)
+                    if (firstSuccess == null) firstSuccess = server to video
+                    if (request.serverId == server.id) requestedMatch = server to video
+                } else {
+                    videoResult.exceptionOrNull()?.let { errors.add(server to it) }
+                }
+                stage = "racing ${servers.size} server(s), ${servers.size - remaining} reported back (${working.size} working)"
+            }
+
+            // give up on stragglers after this so a doomed title reports fast instead of hanging on the slowest server
+            withTimeoutOrNull(15_000L) {
+                while (remaining > 0 && requestedMatch == null && !(request.serverId == null && firstSuccess != null)) {
+                    drainOne()
+                }
+            }
+            if (firstSuccess != null || requestedMatch != null) {
+                withTimeoutOrNull(3_000L) {
+                    while (remaining > 0) drainOne()
+                }
+            }
+            jobs.forEach { it.cancel() }
+            val picked = requestedMatch ?: firstSuccess ?: run {
+                // not every extractor can tell "not found" apart from a network hiccup, so one confirmed sighting is enough
+                val anyNotFound = errors.any { it.second is ContentNotFoundException }
+                val failure = if (anyNotFound) ContentNotFoundException("Not available on ${provider.name}")
+                else (errors.firstOrNull()?.second ?: Exception("no server available"))
+                // per-server breakdown beats whichever error happened to land first in the list
+                val breakdown = errors.joinToString(", ") { (server, error) -> "${server.name}: ${error.describe()}" }
+                DebugLog.error("stream", "no working server on ${provider.name}: ${errors.size}/${servers.size} failed${if (breakdown.isNotBlank()) " - $breakdown" else ""}")
+                throw StreamResolutionLoggedException(failure)
+            }
+            DebugLog.success("stream", "resolved via ${picked.first.name} on ${provider.name}")
+            picked.second to working
+        } ?: run {
+            DebugLog.error("stream", "timed out resolving on ${provider.name} after 45s ($stage)")
+            throw StreamResolutionLoggedException(Exception("Timed out resolving a stream on ${provider.name}"))
+        }
+    }
+}
+
+private fun handleStream(exchange: HttpExchange) {
+    if (exchange.requestMethod != "POST") return sendJson(exchange, 405, """{"error":"POST required"}""")
+    val body = exchange.requestBody.use { it.readBytes().decodeToString() }
+    val request = runCatching { json.decodeFromString<StreamRequest>(body) }.getOrNull()
+        ?: return sendJson(exchange, 400, """{"error":"invalid body"}""")
+    val provider = providerByName(request.provider)
+        ?: return sendJson(exchange, 404, json.encodeToString(StreamResponse(false, error = "unknown provider")))
+
+    val result = runCatching { resolveVideoBlocking(provider, request) }.getOrElse {
+        // covers whatever resolveVideoBlocking didnt already log itself, e.g. a metadata fetch throwing
+        val original = if (it is StreamResolutionLoggedException) it.cause else it
+        if (it !is StreamResolutionLoggedException) DebugLog.error("stream", "resolving ${request.type} on ${provider.name} (${request.itemId}) failed: ${it.describe()}")
+        return sendJson(exchange, 200, json.encodeToString(
+            StreamResponse(false, error = original.message ?: "extraction failed", notFound = original is ContentNotFoundException)
+        ))
+    }
+    val (video, servers) = result
+
+    val token = UUID.randomUUID().toString()
+    streamCache[token] = video
+    // subtitle cdns gate on the video's referer, the browser cant send that so proxy these too
+    val subtitles = video.subtitles.map {
+        SubtitleDto(it.label, "/segment?token=$token&url=" + URLEncoder.encode(it.file, "UTF-8"), it.default)
+    }
+    val serverDtos = servers.map { ServerDto(it.id, it.name) }
+    // trust the extractor's declared type first, extension guessing is just a fallback for the ones that dont set it
+    val isDirectFile = !video.source.startsWith("data:", ignoreCase = true) && (
+        video.type?.startsWith("video/", ignoreCase = true) == true ||
+        Regex("""\.(mp4|mkv|avi|webm|mov|m4v)(?:\?.*)?$""", RegexOption.IGNORE_CASE).containsMatchIn(video.source)
+    )
+    val url = if (isDirectFile) {
+        "/direct?token=$token&url=" + URLEncoder.encode(video.source, "UTF-8")
+    } else {
+        "/manifest.m3u8?token=$token"
+    }
+    sendJson(exchange, 200, json.encodeToString(StreamResponse(
+        true, manifestUrl = url, type = if (isDirectFile) "direct" else "hls",
+        subtitles = subtitles, servers = serverDtos,
+    )))
+}
+
+val httpClient: HttpClient = HttpClient.newBuilder()
+    .followRedirects(HttpClient.Redirect.NORMAL)
+    // http/2 upgrade gets flaky across dozens of unrelated hosts, 1.1 keeps pooling predictable
+    .version(HttpClient.Version.HTTP_1_1)
+    .connectTimeout(java.time.Duration.ofSeconds(10))
+    .build()
+
+private data class CachedImage(val bytes: ByteArray, val contentType: String)
+
+// posters repeat everywhere, keeping them in memory means only the first view pays the round trip
+private val imageCache = object : LinkedHashMap<String, CachedImage>(256, 0.75f, true) {
+    override fun removeEldestEntry(eldest: MutableMap.MutableEntry<String, CachedImage>?) = size > 600
+}
+
+// java's HttpClient throws on these instead of ignoring them, extractors set "Connection" etc all the time
+private val RESTRICTED_HEADERS = setOf(
+    "connection", "content-length", "date", "expect", "from", "host", "upgrade", "via", "warning"
+)
+
+fun applyHeaders(builder: HttpRequest.Builder, headers: Map<String, String>?) {
+    headers?.forEach { (k, v) -> if (k.lowercase() !in RESTRICTED_HEADERS) builder.header(k, v) }
+}
+
+// ofInputStream() returns as soon as headers arrive so a huge file that ignores our Range header doesnt get pulled in full,
+// closing the stream right away is what actually aborts the connection instead of just discarding what it downloads
+private fun isPlayable(video: Video): Boolean {
+    if (video.source.startsWith("data:", ignoreCase = true)) return true
+    return try {
+        val builder = HttpRequest.newBuilder(URI.create(video.source))
+            .header("Range", "bytes=0-1")
+            .timeout(java.time.Duration.ofSeconds(8))
+            .GET()
+        applyHeaders(builder, video.headers)
+        val response = httpClient.send(builder.build(), HttpResponse.BodyHandlers.ofInputStream())
+        response.body().close()
+        response.statusCode() in 200..299
+    } catch (e: Exception) {
+        false
+    }
+}
+
+// caps the buffer so a mislabeled direct video link that slips past isDirectFile cant hang the request
+private const val MAX_MANIFEST_BYTES = 4 * 1024 * 1024
+
+// url is the post-redirect location, relative paths in the manifest resolve against that, not the original request url
+data class ManifestFetch(val url: String, val text: String)
+
+fun manifestTextFor(url: String, headers: Map<String, String>?): ManifestFetch? {
+    if (url.startsWith("data:")) {
+        val payload = url.substringAfter(",", "")
+        if (payload.isBlank()) return null
+        return runCatching { ManifestFetch(url, String(Base64.getDecoder().decode(payload))) }.getOrNull()
+    }
+    // some cdns are genuinely flaky, a retry often turns an error page into a real manifest
+    repeat(2) {
+        val fetch = runCatching {
+            val builder = HttpRequest.newBuilder(URI.create(url)).GET()
+            applyHeaders(builder, headers)
+            val response = httpClient.send(builder.build(), HttpResponse.BodyHandlers.ofInputStream())
+            if (response.statusCode() !in 200..299) return@runCatching null
+            val text = response.body().use { input ->
+                val buffer = java.io.ByteArrayOutputStream()
+                val chunk = ByteArray(8192)
+                while (true) {
+                    val n = input.read(chunk)
+                    if (n == -1) break
+                    buffer.write(chunk, 0, n)
+                    if (buffer.size() > MAX_MANIFEST_BYTES) return@runCatching null
+                }
+                buffer.toString(Charsets.UTF_8)
+            }
+            ManifestFetch(response.uri().toString(), text)
+        }.getOrNull()
+        if (fetch != null) return fetch
+    }
+    return null
+}
+
+private fun serveManifest(exchange: HttpExchange) {
+    val params = queryParams(exchange)
+    val token = params["token"] ?: return run { exchange.sendResponseHeaders(400, -1); exchange.close() }
+    val video = streamCache[token] ?: return run { exchange.sendResponseHeaders(404, -1); exchange.close() }
+    val targetUrl = params["url"] ?: video.source
+    val referer = video.headers?.entries?.firstOrNull { it.key.equals("referer", ignoreCase = true) }?.value
+
+    val fetch = manifestTextFor(targetUrl, video.headers)
+    if (fetch == null) {
+        exchange.sendResponseHeaders(502, -1)
+        exchange.close()
+        return
+    }
+    val text = fetch.text
+
+    fun resolve(uri: String): String {
+        if (uri.startsWith("http://") || uri.startsWith("https://")) return uri
+        val base = fetch.url.takeIf { it.startsWith("http") } ?: referer ?: return uri
+        return runCatching { URI.create(base).resolve(uri).toString() }.getOrDefault(uri)
+    }
+
+    val isMaster = text.lineSequence().any { it.startsWith("#EXT-X-STREAM-INF") }
+    val attrUriRegex = Regex("URI=\"([^\"]+)\"")
+
+    val rewritten = buildString {
+        for (rawLine in text.lineSequence()) {
+            val line = rawLine.trimEnd('\r')
+            when {
+                line.startsWith("#EXT-X-") && attrUriRegex.containsMatchIn(line) -> {
+                    val uri = attrUriRegex.find(line)!!.groupValues[1]
+                    val resolved = resolve(uri)
+                    val endpoint = if (line.startsWith("#EXT-X-MEDIA")) "/manifest.m3u8" else "/segment"
+                    val proxied = "$endpoint?token=$token&url=" + URLEncoder.encode(resolved, "UTF-8")
+                    append(line.replace(uri, proxied))
+                }
+                line.startsWith("#") || line.isBlank() -> append(line)
+                else -> {
+                    val endpoint = if (isMaster) "/manifest.m3u8" else "/segment"
+                    append("$endpoint?token=$token&url=" + URLEncoder.encode(resolve(line), "UTF-8"))
+                }
+            }
+            append("\n")
+        }
+    }
+
+    val bytes = rewritten.toByteArray()
+    exchange.responseHeaders.add("Content-Type", "application/vnd.apple.mpegurl")
+    exchange.sendResponseHeaders(200, bytes.size.toLong())
+    exchange.responseBody.use { it.write(bytes) }
+}
+
+// img tags cant set headers so we spoof referer/ua here and stream the bytes back
+private const val ARTWORK_HEADERS_FRAGMENT_KEY = "sf_headers"
+
+private fun decodeArtworkHeaders(rawUrl: String): Map<String, String> {
+    val fragment = rawUrl.substringAfter('#', "").takeIf { it.isNotBlank() } ?: return emptyMap()
+    val encoded = fragment.split("&").firstOrNull { it.startsWith("$ARTWORK_HEADERS_FRAGMENT_KEY=") }
+        ?.substringAfter("=") ?: return emptyMap()
+    return runCatching {
+        val decoded = String(Base64.getUrlDecoder().decode(encoded), Charsets.UTF_8)
+        json.parseToJsonElement(decoded).jsonObject.mapValues { it.value.jsonPrimitive.content }
+    }.getOrDefault(emptyMap())
+}
+
+private fun stripArtworkFragment(rawUrl: String): String {
+    val hashIdx = rawUrl.indexOf('#')
+    if (hashIdx == -1) return rawUrl
+    val base = rawUrl.substring(0, hashIdx)
+    val remaining = rawUrl.substring(hashIdx + 1).split("&")
+        .filterNot { it.startsWith("$ARTWORK_HEADERS_FRAGMENT_KEY=") }
+        .joinToString("&")
+    return if (remaining.isBlank()) base else "$base#$remaining"
+}
+
+// some cdns 403 a bare request, faking referer as the img's own domain usually works
+private const val IMAGE_USER_AGENT = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
+
+private fun fetchImage(url: String, headers: Map<String, String>): CachedImage? {
+    return try {
+        val builder = HttpRequest.newBuilder(URI.create(url)).GET()
+        if (headers.isNotEmpty()) {
+            applyHeaders(builder, headers)
+        } else {
+            runCatching {
+                val target = URI.create(url)
+                builder.header("Referer", "${target.scheme}://${target.host}/")
+            }
+            builder.header("User-Agent", IMAGE_USER_AGENT)
+        }
+        val response = httpClient.send(builder.build(), HttpResponse.BodyHandlers.ofByteArray())
+        val contentType = response.headers().firstValue("content-type").orElse("image/jpeg")
+        // a missing wp upload 301s to the homepage, lands here as a 200 with html not an image
+        if (response.statusCode() in 200..299 && contentType.startsWith("image/")) CachedImage(response.body(), contentType) else null
+    } catch (e: Exception) {
+        null
+    }
+}
+
+// the client above uses the system resolver, which is exactly what an isp block poisons (a blocked image cdn ends up on
+// 127.0.0.1 and the poster comes back as a 502). the providers already go through doh, so a retry through the same client
+private fun fetchImageDoh(url: String, headers: Map<String, String>): CachedImage? {
+    return try {
+        val requestHeaders = headers.ifEmpty {
+            buildMap {
+                runCatching {
+                    val target = URI.create(url)
+                    put("Referer", "${target.scheme}://${target.host}/")
+                }
+                put("User-Agent", IMAGE_USER_AGENT)
+            }
+        }
+        NetworkClient.fetchImageBytes(url, requestHeaders)?.let { (bytes, contentType) -> CachedImage(bytes, contentType) }
+    } catch (e: Exception) {
+        null
+    }
+}
+
+private fun serveImage(exchange: HttpExchange) {
+    val params = queryParams(exchange)
+    val rawUrl = params["url"]
+    if (rawUrl == null) {
+        exchange.sendResponseHeaders(400, -1)
+        exchange.close()
+        return
+    }
+    val headers = decodeArtworkHeaders(rawUrl)
+    val cleanUrl = stripArtworkFragment(rawUrl)
+
+    val cached = synchronized(imageCache) { imageCache[cleanUrl] }
+    if (cached != null) {
+        exchange.responseHeaders.add("Content-Type", cached.contentType)
+        exchange.responseHeaders.add("Cache-Control", "public, max-age=86400")
+        exchange.sendResponseHeaders(200, cached.bytes.size.toLong())
+        exchange.responseBody.use { it.write(cached.bytes) }
+        return
+    }
+
+    runCatching {
+        val image = fetchImage(cleanUrl, headers) ?: fetchImageDoh(cleanUrl, headers)
+        if (image != null) {
+            exchange.responseHeaders.add("Content-Type", image.contentType)
+            exchange.responseHeaders.add("Cache-Control", "public, max-age=86400")
+            synchronized(imageCache) { imageCache[cleanUrl] = image }
+            exchange.sendResponseHeaders(200, image.bytes.size.toLong())
+            exchange.responseBody.use { it.write(image.bytes) }
+        } else {
+            exchange.responseHeaders.add("Cache-Control", "no-store")
+            exchange.sendResponseHeaders(404, -1)
+            exchange.close()
+        }
+    }.onFailure {
+        runCatching {
+            exchange.responseHeaders.add("Cache-Control", "no-store")
+            exchange.sendResponseHeaders(502, -1)
+        }
+        exchange.close()
+    }
+}
+
+// fixed allowlist instead of resolving the request path directly, no path traversal to worry about
+private val BUNDLED_ASSETS = mapOf("pluto-tv.webp" to "image/webp")
+
+private fun serveAsset(exchange: HttpExchange) {
+    val name = exchange.requestURI.path.substringAfterLast('/')
+    val contentType = BUNDLED_ASSETS[name]
+    val bytes = contentType?.let { bundledAssetOpener(name)?.use { it.readBytes() } }
+    if (bytes == null) {
+        exchange.sendResponseHeaders(404, -1)
+        exchange.close()
+        return
+    }
+    exchange.responseHeaders.add("Content-Type", contentType)
+    exchange.responseHeaders.add("Cache-Control", "public, max-age=86400")
+    exchange.sendResponseHeaders(200, bytes.size.toLong())
+    exchange.responseBody.use { it.write(bytes) }
+}
+
+private fun serveSegment(exchange: HttpExchange) {
+    val params = queryParams(exchange)
+    val token = params["token"]
+    val targetUrl = params["url"]
+    if (token == null || targetUrl == null) {
+        exchange.sendResponseHeaders(400, -1)
+        exchange.close()
+        return
+    }
+    val video = streamCache[token]
+    if (video == null) {
+        exchange.sendResponseHeaders(404, -1)
+        exchange.close()
+        return
+    }
+    runCatching {
+        val builder = HttpRequest.newBuilder(URI.create(targetUrl)).GET()
+        applyHeaders(builder, video.headers)
+        val response = httpClient.send(builder.build(), HttpResponse.BodyHandlers.ofByteArray())
+        // some cdns serve subtitles as octet-stream, browsers need the real type to parse a track
+        val contentType = if (targetUrl.substringBefore('?').endsWith(".vtt", ignoreCase = true)) "text/vtt"
+        else response.headers().firstValue("content-type").orElse("application/octet-stream")
+        exchange.responseHeaders.add("Content-Type", contentType)
+        exchange.sendResponseHeaders(response.statusCode(), response.body().size.toLong())
+        exchange.responseBody.use { it.write(response.body()) }
+    }.onFailure {
+        it.printStackTrace()
+        runCatching { exchange.sendResponseHeaders(502, -1) }
+        exchange.close()
+    }
+}
+
+private fun serveDirect(exchange: HttpExchange) {
+    val params = queryParams(exchange)
+    val token = params["token"]
+    val targetUrl = params["url"]
+    if (token == null || targetUrl == null) {
+        exchange.sendResponseHeaders(400, -1)
+        exchange.close()
+        return
+    }
+    val video = streamCache[token]
+    if (video == null) {
+        exchange.sendResponseHeaders(404, -1)
+        exchange.close()
+        return
+    }
+    runCatching {
+        val builder = HttpRequest.newBuilder(URI.create(targetUrl)).GET()
+        applyHeaders(builder, video.headers)
+        // forward the browser's own range so seeking actually works on a plain file
+        exchange.requestHeaders.getFirst("Range")?.let { builder.header("Range", it) }
+
+        val response = httpClient.send(builder.build(), HttpResponse.BodyHandlers.ofInputStream())
+        val contentType = response.headers().firstValue("content-type").orElse("video/mp4")
+        exchange.responseHeaders.add("Content-Type", contentType)
+        exchange.responseHeaders.add("Accept-Ranges", "bytes")
+        response.headers().firstValue("content-range").ifPresent { exchange.responseHeaders.add("Content-Range", it) }
+        val contentLength = response.headers().firstValue("content-length").map { it.toLong() }.orElse(0L)
+        // streamed not buffered, needed for big files
+        exchange.sendResponseHeaders(response.statusCode(), if (contentLength > 0) contentLength else 0)
+        response.body().use { input -> exchange.responseBody.use { output -> input.copyTo(output) } }
+    }.onFailure {
+        it.printStackTrace()
+        runCatching { exchange.sendResponseHeaders(502, -1) }
+        exchange.close()
+    }
+}
